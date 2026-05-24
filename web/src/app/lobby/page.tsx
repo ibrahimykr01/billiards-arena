@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/lib/auth";
 import { getSocket } from "@/lib/socket";
@@ -42,7 +42,7 @@ function NamePrompt({ onDone }: { onDone: (name: string) => void }) {
   );
 }
 
-export default function LobbyPage() {
+function LobbyContent() {
   const { user, loginGuest } = useAuth();
   const router = useRouter();
   const params = useSearchParams();
@@ -167,5 +167,13 @@ export default function LobbyPage() {
         </div>
       </main>
     </>
+  );
+}
+
+export default function LobbyPage() {
+  return (
+    <Suspense>
+      <LobbyContent />
+    </Suspense>
   );
 }
