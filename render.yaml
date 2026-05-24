@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: billiards-arena-server
+    env: node
+    buildCommand: npm install && npm run build --workspace=shared && npm run build --workspace=server
+    startCommand: npm --workspace server run start
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGIN
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGO_URI
+        sync: false
