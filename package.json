@@ -1,0 +1,16 @@
+{
+  "name": "billiards-arena",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": ["server", "web", "shared"],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm --workspace server run dev",
+    "dev:web": "npm --workspace web run dev",
+    "build": "npm --workspace shared run build && npm --workspace server run build && npm --workspace web run build",
+    "start:server": "npm --workspace server run start"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
