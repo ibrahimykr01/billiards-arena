@@ -79,7 +79,10 @@ export function attachSocket(io: Server) {
       room.isAI = true;
       room.players[1] = { id: "ai_" + difficulty, name: `AI (${difficulty})`, rating: 900 };
       (room as any).aiDifficulty = difficulty;
+      // Human (seat 0) always breaks — avoids the game "shooting by itself" on first move.
+      room.state.turn = 0;
       joinRoom(socket, room);
+      // maybeRunAI is a no-op here because turn === 0, but keep it for consistency.
       maybeRunAI(io, room);
     });
 
@@ -178,11 +181,16 @@ export function attachSocket(io: Server) {
     if (room.state.turn !== 1) return;
     const difficulty: AIDifficulty = (room as any).aiDifficulty || "medium";
     setTimeout(() => {
+      // Re-check turn inside the delay — human might have already shot (e.g. fast click).
+      if (room.state.turn !== 1) return;
+      if (room.state.winner !== null) return;
       if (room.state.ballInHand) {
         const p = aiPlaceCue(room.state);
         room.placeCue(1, p.x, p.y);
         io.to(room.id).emit("game:state", { state: room.state });
       }
+      // Guard again after placing — turn could theoretically change.
+      if (room.state.turn !== 1) return;
       const shot = planAIShot(room.state, 1, difficulty);
       const initialBalls = room.state.balls.map(b => ({ id: b.id, x: b.pos.x, y: b.pos.y, pocketed: b.pocketed }));
       const res = room.performShot(1, shot);

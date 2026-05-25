@@ -1,3 +1,4 @@
+import * as Matter from "matter-js";
 import {
   Ball,
   GameState,
@@ -86,7 +87,10 @@ export function applyShot(state: GameState, shot: ShotInput): void {
   const cue = state.balls[0];
   if (cue.pocketed) return;
   const power = Math.max(0, Math.min(1, shot.power));
-  const speed = power * MAX_SHOT_SPEED;
+  // Quadratic power curve: 50% drag → 25% speed, 80% drag → 64% speed.
+  // This matches the real feel of a cue — gentle taps are much softer,
+  // and you need to really commit to get a hard shot.
+  const speed = power * power * MAX_SHOT_SPEED;
   const dir: Vec2 = { x: Math.cos(shot.angle), y: Math.sin(shot.angle) };
   cue.vel.x = dir.x * speed;
   cue.vel.y = dir.y * speed;
@@ -146,44 +150,270 @@ export function simulateShot(state: GameState, table: TableSpec = TABLE): ShotEv
 }
 
 /**
- * Same as simulateShot, but records a frame every ~1/60s and ball/cushion/pocket
- * sound events with timing, so the client can play back smooth animation.
+ * Matter.js-backed shot recording.
+ *
+ * Ball–ball collision resolution is delegated to Matter.js (10 position
+ * iterations + 8 velocity iterations per step) which handles multi-ball chain
+ * reactions far more accurately than a single-pass pairwise approach.
+ *
+ * Wall bounce, Coulomb friction, cue-ball spin effects, and pocket detection
+ * remain as custom code so we keep exact control over restitution per surface,
+ * the blended sliding/rolling deceleration model, and pocket entry geometry.
+ *
+ * IMPORTANT — velocity unit convention:
+ *   Our physics model stores velocities in UNITS PER SECOND (ball.vel.x = 185
+ *   means 185 table-units per second).  Matter.js body.velocity is in UNITS
+ *   PER ENGINE-STEP (displacement added each Engine.update tick).  We convert
+ *   at every boundary using toStep/toSec so the two worlds never mix.
  */
 export function simulateShotRecording(state: GameState, table: TableSpec = TABLE): ShotRecording {
+  // --- Velocity unit helpers ---
+  const toStep = (vSec: number)  => vSec  * FIXED_DT;   // per-sec  → per-step
+  const toSec  = (vStep: number) => vStep / FIXED_DT;   // per-step → per-sec
+
+  // ---- Matter.js engine (zero gravity = top-down view) ----
+  const engine = Matter.Engine.create({
+    gravity: { x: 0, y: 0, scale: 0 },
+    positionIterations: 10,
+    velocityIterations: 8,
+    constraintIterations: 2,
+  });
+
+  // ---- Create a dynamic circle body for every active ball ----
+  const mBodies = new Map<number, Matter.Body>();
+  const cueSpin = { spin: 0, side: 0 }; // managed separately; Matter.js has no spin model
+
+  for (const ball of state.balls) {
+    if (ball.pocketed) continue;
+    const body = Matter.Bodies.circle(ball.pos.x, ball.pos.y, ball.radius, {
+      restitution: BALL_RESTITUTION,
+      friction: 0,
+      frictionAir: 0,      // Coulomb deceleration applied manually each step
+      frictionStatic: 0,
+      density: 1,
+      label: `ball:${ball.id}`,
+    });
+    // ball.vel is per-sec; Matter.js needs per-step
+    Matter.Body.setVelocity(body, { x: toStep(ball.vel.x), y: toStep(ball.vel.y) });
+    Matter.Composite.add(engine.world, body);
+    mBodies.set(ball.id, body);
+    if (ball.id === 0) { cueSpin.spin = ball.spin; cueSpin.side = ball.side; }
+  }
+
+  // ---- Sound + event tracking ----
   const events: ShotEvents = {
     pocketed: [], firstHitId: null, cushionHits: 0, ballHits: 0, cueOffTable: false,
   };
-  const frames: ShotFrame[] = [];
   const sounds: ShotSoundEvent[] = [];
-  const FRAME_INTERVAL = 1 / 60;
-  const STEPS_PER_FRAME = Math.max(1, Math.round(FRAME_INTERVAL / FIXED_DT));
+  let firstHitDetected = false;
+  // `t` is declared below but closures capture it by reference — OK.
   let t = 0;
-  let stepIdx = 0;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  Matter.Events.on(engine, "collisionStart", (event: any) => {
+    for (const pair of event.pairs as Matter.Pair[]) {
+      const la = (pair.bodyA as Matter.Body & { label: string }).label;
+      const lb = (pair.bodyB as Matter.Body & { label: string }).label;
+      if (!la.startsWith("ball:") || !lb.startsWith("ball:")) continue;
+
+      events.ballHits++;
+      const idA = parseInt(la.split(":")[1], 10);
+      const idB = parseInt(lb.split(":")[1], 10);
+
+      // Ball-hit sound — relative speed (per-step → per-sec for normalisation)
+      const relSpd = Math.hypot(
+        pair.bodyA.velocity.x - pair.bodyB.velocity.x,
+        pair.bodyA.velocity.y - pair.bodyB.velocity.y,
+      );
+      sounds.push({ t, type: "ball", strength: Math.min(1, toSec(relSpd) / 150), ids: [idA, idB] });
+
+      if (!firstHitDetected && (idA === 0 || idB === 0)) {
+        events.firstHitId = idA === 0 ? idB : idA;
+        firstHitDetected = true;
+      }
+
+      // Top/back spin transfer: cue ball follows through or draws back after contact.
+      if ((idA === 0 || idB === 0) && Math.abs(cueSpin.spin) > 0.01) {
+        const cueBody = mBodies.get(0);
+        if (cueBody) {
+          const spd    = Math.hypot(cueBody.velocity.x, cueBody.velocity.y); // per-step
+          const spdSec = toSec(spd);
+          if (spdSec > 1) {
+            // transfer in per-sec space, then convert to per-step delta
+            const transferSec  = cueSpin.spin * spdSec * 0.55;
+            const transferStep = toStep(transferSec);
+            Matter.Body.setVelocity(cueBody, {
+              x: cueBody.velocity.x + (cueBody.velocity.x / spd) * transferStep,
+              y: cueBody.velocity.y + (cueBody.velocity.y / spd) * transferStep,
+            });
+            cueSpin.spin *= 0.35; // spin mostly consumed at contact
+          }
+        }
+      }
+    }
+  });
+
+  // ---- Helpers shared with custom wall/pocket code ----
+  const inMouth = (coord: number, intervals: [number, number][]): boolean => {
+    for (const [a, b] of intervals) if (coord >= a && coord <= b) return true;
+    return false;
+  };
+
+  // ---- Simulation loop ----
+  const pocketedIds = new Set<number>();
+  const pocketedPositions = new Map<number, { x: number; y: number }>();
+  const frames: ShotFrame[] = [];
+  const STEP_MS    = FIXED_DT * 1000;
+  const FRAME_EVERY = Math.max(1, Math.round((1 / 60) / FIXED_DT)); // ~4 steps per frame
+
+  let stepIdx = 0, safety = 0;
 
   const captureFrame = () => {
-    frames.push({
-      t,
-      balls: state.balls.map(b => ({ id: b.id, x: b.pos.x, y: b.pos.y, pocketed: b.pocketed })),
-    });
+    const ballArr: ShotFrame["balls"] = [];
+    for (const ball of state.balls) {
+      const body = mBodies.get(ball.id);
+      if (body && !pocketedIds.has(ball.id)) {
+        ballArr.push({ id: ball.id, x: body.position.x, y: body.position.y, pocketed: false });
+      } else if (pocketedIds.has(ball.id)) {
+        const pos = pocketedPositions.get(ball.id) ?? { x: ball.pos.x, y: ball.pos.y };
+        ballArr.push({ id: ball.id, x: pos.x, y: pos.y, pocketed: true });
+      } else {
+        // Pre-existing pocketed ball — keep at its stored position
+        ballArr.push({ id: ball.id, x: ball.pos.x, y: ball.pos.y, pocketed: true });
+      }
+    }
+    frames.push({ t, balls: ballArr });
   };
   captureFrame();
 
-  const recorder: Recorder = {
-    onBallHit: (strength, a, b) => sounds.push({ t, type: "ball", strength, ids: [a, b] }),
-    onCushion: (strength, id) => sounds.push({ t, type: "cushion", strength, ids: [id] }),
-    onPocket: (id) => sounds.push({ t, type: "pocket", strength: 1, ids: [id] }),
-  };
-
-  let safety = 0;
-  while (!allStopped(state.balls) && safety < 60_000) {
-    stepFixed(state, table, FIXED_DT, events, recorder);
+  while (safety < 60_000) {
+    // 1) Matter.js resolves ball–ball contacts with iterative constraint solving
+    Matter.Engine.update(engine, STEP_MS);
     t += FIXED_DT;
     stepIdx++;
-    if (stepIdx % STEPS_PER_FRAME === 0) captureFrame();
     safety++;
+
+    // 2) Coulomb (blended sliding/rolling) friction applied manually to each body.
+    //    All friction constants and blend thresholds are in UNITS/SEC, so we
+    //    convert body.velocity (per-step) to per-sec, compute, then convert back.
+    for (const [id, body] of mBodies) {
+      if (pocketedIds.has(id)) continue;
+      const vx = body.velocity.x, vy = body.velocity.y;   // per-step
+      const speedStep = Math.hypot(vx, vy);
+      if (speedStep > 0.00001) {
+        const speedSec = toSec(speedStep);                 // per-sec
+        const tt = Math.min(1, Math.max(0, (speedSec - 40) / 90));
+        const blend = tt * tt * (3 - 2 * tt);             // smoothstep
+        const decelSec = ROLLING_FRICTION * 320 + (SLIDING_FRICTION * 220 - ROLLING_FRICTION * 320) * blend;
+        const newSpeedSec = Math.max(0, speedSec - decelSec * FIXED_DT);
+        const k = newSpeedSec / speedSec;
+        Matter.Body.setVelocity(body, { x: vx * k, y: vy * k });
+      }
+
+      // Side English: continuous Magnus-like lateral curve on the cue ball.
+      // Acceleration = side * 30 units/sec²; convert to per-step velocity delta.
+      if (id === 0 && Math.abs(cueSpin.side) > 0.001) {
+        const vx2 = body.velocity.x, vy2 = body.velocity.y;
+        const perp = { x: -vy2, y: vx2 };
+        const pl   = Math.hypot(perp.x, perp.y) || 1;
+        const accStep = cueSpin.side * 30 * FIXED_DT * FIXED_DT; // acc(u/s²) * dt² = Δv per-step
+        Matter.Body.setVelocity(body, {
+          x: vx2 + (perp.x / pl) * accStep,
+          y: vy2 + (perp.y / pl) * accStep,
+        });
+        cueSpin.side *= Math.exp(-SPIN_FRICTION * FIXED_DT);
+        cueSpin.spin *= Math.exp(-SPIN_FRICTION * FIXED_DT);
+      }
+    }
+
+    // 3) Custom axis-aligned wall bounce — exact CUSHION_RESTITUTION control
+    for (const [id, body] of mBodies) {
+      if (pocketedIds.has(id)) continue;
+      const r = BALL_RADIUS;
+      let bounced = false;
+
+      if (body.position.x - r < 0 && !inMouth(body.position.y, table.mouths.left)) {
+        Matter.Body.setPosition(body, { x: r, y: body.position.y });
+        Matter.Body.setVelocity(body, { x:  Math.abs(body.velocity.x) * table.cushionRestitution, y: body.velocity.y });
+        bounced = true;
+      } else if (body.position.x + r > table.width && !inMouth(body.position.y, table.mouths.right)) {
+        Matter.Body.setPosition(body, { x: table.width - r, y: body.position.y });
+        Matter.Body.setVelocity(body, { x: -Math.abs(body.velocity.x) * table.cushionRestitution, y: body.velocity.y });
+        bounced = true;
+      }
+      if (body.position.y - r < 0 && !inMouth(body.position.x, table.mouths.top)) {
+        Matter.Body.setPosition(body, { x: body.position.x, y: r });
+        Matter.Body.setVelocity(body, { x: body.velocity.x, y:  Math.abs(body.velocity.y) * table.cushionRestitution });
+        bounced = true;
+      } else if (body.position.y + r > table.height && !inMouth(body.position.x, table.mouths.bottom)) {
+        Matter.Body.setPosition(body, { x: body.position.x, y: table.height - r });
+        Matter.Body.setVelocity(body, { x: body.velocity.x, y: -Math.abs(body.velocity.y) * table.cushionRestitution });
+        bounced = true;
+      }
+
+      if (bounced) {
+        events.cushionHits++;
+        // Convert per-step speed to per-sec for consistent sound strength
+        const spd = Math.hypot(body.velocity.x, body.velocity.y);
+        sounds.push({ t, type: "cushion", strength: Math.min(1, toSec(spd) / 200), ids: [id] });
+      }
+    }
+
+    // 4) Pocket detection
+    for (const [id, body] of mBodies) {
+      if (pocketedIds.has(id)) continue;
+      for (const p of table.pockets) {
+        const dx = body.position.x - p.pos.x;
+        const dy = body.position.y - p.pos.y;
+        const threshold = p.radius + BALL_RADIUS * 0.6;
+        if (dx * dx + dy * dy < threshold * threshold) {
+          pocketedPositions.set(id, { x: body.position.x, y: body.position.y });
+          pocketedIds.add(id);
+          events.pocketed.push(id);
+          Matter.Composite.remove(engine.world, body);
+          sounds.push({ t, type: "pocket", strength: 1, ids: [id] });
+          break;
+        }
+      }
+    }
+
+    // 5) Frame capture at ~60 fps
+    if (stepIdx % FRAME_EVERY === 0) captureFrame();
+
+    // 6) Early exit when all active balls have stopped.
+    //    Compare per-sec speed against STOP_THRESHOLD (which is in per-sec units).
+    let allStop = true;
+    for (const [id, body] of mBodies) {
+      if (pocketedIds.has(id)) continue;
+      if (toSec(Math.hypot(body.velocity.x, body.velocity.y)) > STOP_THRESHOLD) {
+        allStop = false; break;
+      }
+    }
+    if (allStop) break;
   }
-  for (const b of state.balls) if (v.len(b.vel) < STOP_THRESHOLD) b.vel = { x: 0, y: 0 };
-  captureFrame();
+
+  captureFrame(); // final frame
+
+  // ---- Sync Matter.js final state back into state.balls ----
+  for (const [id, body] of mBodies) {
+    const ball = state.balls.find(b => b.id === id);
+    if (!ball) continue;
+    if (pocketedIds.has(id)) {
+      ball.pocketed = true;
+      ball.vel = { x: 0, y: 0 };
+      const pp = pocketedPositions.get(id);
+      if (pp) { ball.pos.x = pp.x; ball.pos.y = pp.y; }
+    } else {
+      ball.pos.x = body.position.x;
+      ball.pos.y = body.position.y;
+      // Convert per-step back to per-sec before storing
+      ball.vel.x = toSec(body.velocity.x);
+      ball.vel.y = toSec(body.velocity.y);
+      if (v.len(ball.vel) < STOP_THRESHOLD) ball.vel = { x: 0, y: 0 };
+    }
+  }
+
+  Matter.Engine.clear(engine);
   state.shotInProgress = false;
   return { events, frames, sounds, duration: t };
 }
@@ -403,16 +633,15 @@ function stepFixed(state: GameState, table: TableSpec, dt: number, events?: Shot
   }
 
   // 4) pockets
-  // A ball drops in when its CENTER crosses the pocket lip. We use a small
-  // negative bias so the ball is considered pocketed slightly before the
-  // center reaches the geometric pocket edge — this matches how real pool
-  // tables behave and avoids the "perfect aim only" feeling.
+  // A ball drops when its edge overlaps the pocket enough. Using a generous
+  // threshold (pocket_radius + 0.6 * ball_radius) so "close" shots still
+  // score — avoids the frustrating "perfect-aim only" feeling.
   for (const b of balls) {
     if (b.pocketed) continue;
     for (const p of table.pockets) {
       const dx = b.pos.x - p.pos.x;
       const dy = b.pos.y - p.pos.y;
-      const threshold = p.radius + b.radius * 0.15;
+      const threshold = p.radius + b.radius * 0.6;
       if (dx * dx + dy * dy < threshold * threshold) {
         b.pocketed = true;
         b.vel = { x: 0, y: 0 };
