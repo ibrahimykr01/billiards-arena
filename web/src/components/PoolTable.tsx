@@ -26,7 +26,7 @@ export const PoolTable: React.FC<Props> = ({ state, mySeat, onShoot, onPlaceCue,
   const wrapRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(HUD_SCALE);
   const [angle, setAngle] = useState(0);
-  const [power, setPower] = useState(0.6);
+  const [power, setPower] = useState(0.70); // 0.70² = ~49% gerçek güç — iyi default
   const [spinX, setSpinX] = useState(0);
   const [spinY, setSpinY] = useState(0);
   const [aiming, setAiming] = useState(true);
@@ -173,7 +173,7 @@ export const PoolTable: React.FC<Props> = ({ state, mySeat, onShoot, onPlaceCue,
   const phaseRef = useRef<number>(PHASE_IDLE);
   const downRef = useRef({ x: 0, y: 0 });
   const chargeAngleRef = useRef(0);
-  const MAX_PULL_PX = 220; // screen pixels for max power
+  const MAX_PULL_PX = 300; // screen pixels for max power — longer pull = more control
   const CHARGE_TRIGGER_PX = 10; // backward drag distance that switches to CHARGE
 
   const myTurn = mySeat !== null && state.turn === mySeat && !state.shotInProgress && state.winner === null && !state.ballInHand;
@@ -304,7 +304,7 @@ export const PoolTable: React.FC<Props> = ({ state, mySeat, onShoot, onPlaceCue,
                  onChange={e => setPower(parseFloat(e.target.value))}
                  className="w-full accent-cyan-400" />
           <div className="flex justify-between text-xs text-white/50 mt-1">
-            <span>0%</span><span>{Math.round(power * 100)}%</span><span>100%</span>
+            <span>Hafif</span><span>{Math.round(power * power * 100)}%</span><span>Tam</span>
           </div>
         </div>
 
@@ -899,22 +899,9 @@ function drawBall(
     // single red mark on the front pole (if visible)
     drawCap(ctx, x, y, r, pole, CAP_CUE_DOT, "#d61f1f");
   } else if (b.group === "stripe") {
-    // White base, then a colored stripe band rotated by the pole's XY projection.
-    // Using 2D rectangle (clipped to ball circle) instead of the 3D cap polygon
-    // for a stable, flicker-free appearance as the ball rolls.
-    ctx.fillStyle = "#fafafa";
-    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-
-    ctx.save();
-    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.clip();
-    const plen = Math.hypot(pole.x, pole.y);
-    const stripeAngle = plen > 0.01 ? Math.atan2(pole.y, pole.x) + Math.PI / 2 : Math.PI / 2;
-    ctx.translate(x, y);
-    ctx.rotate(stripeAngle);
-    const stripeHalf = r * 0.40;
+    // Plain solid red ball (same rendering as solid group)
     ctx.fillStyle = color;
-    ctx.fillRect(-r, -stripeHalf, r * 2, stripeHalf * 2);
-    ctx.restore();
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
   } else {
     // solid (or 8): filled colored circle
     ctx.fillStyle = color;
@@ -958,10 +945,10 @@ function drawBall(
 
 // Ball colors used for cheat trajectory lines. Mirrors the table renderer's palette.
 const CHEAT_BALL_COLOR: Record<number, string> = {
-  1: "#f5c518", 2: "#1659d9", 3: "#d61f1f", 4: "#5b2a8b", 5: "#e07b1c",
-  6: "#0d6e3a", 7: "#7a1a1a", 8: "#e6e6e6",
-  9: "#f5c518", 10: "#1659d9", 11: "#d61f1f", 12: "#5b2a8b",
-  13: "#e07b1c", 14: "#0d6e3a", 15: "#7a1a1a",
+  1: "#0d1f4a", 2: "#0d1f4a", 3: "#0d1f4a", 4: "#0d1f4a", 5: "#0d1f4a",
+  6: "#0d1f4a", 7: "#0d1f4a", 8: "#e6e6e6",
+  9: "#e91e8c", 10: "#e91e8c", 11: "#e91e8c", 12: "#e91e8c",
+  13: "#e91e8c", 14: "#e91e8c", 15: "#e91e8c",
 };
 
 function hexToRgba(hex: string, a: number): string {
@@ -1197,9 +1184,11 @@ function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: n
 
 const ballColors: Record<number, string> = {
   0: "#ffffff",
-  1: "#f5c518", 2: "#1659d9", 3: "#d61f1f", 4: "#5b2a8b", 5: "#e07b1c", 6: "#0d6e3a", 7: "#7a1a1a",
+  // Solid group → gece mavisi (night blue)
+  1: "#0d1f4a", 2: "#0d1f4a", 3: "#0d1f4a", 4: "#0d1f4a", 5: "#0d1f4a", 6: "#0d1f4a", 7: "#0d1f4a",
   8: "#0a0a0a",
-  9: "#f5c518", 10: "#1659d9", 11: "#d61f1f", 12: "#5b2a8b", 13: "#e07b1c", 14: "#0d6e3a", 15: "#7a1a1a",
+  // Stripe group → pembe (pink)
+  9: "#e91e8c", 10: "#e91e8c", 11: "#e91e8c", 12: "#e91e8c", 13: "#e91e8c", 14: "#e91e8c", 15: "#e91e8c",
 };
 
 export default PoolTable;
